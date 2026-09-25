@@ -1,22 +1,20 @@
+import io
+import json
 import os
 import urllib.request
-import json
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from PIL import Image
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 
-# ---------------------------------------------------------------------------
-# 1. Download URLs from GitHub Releases
-# ---------------------------------------------------------------------------
+# 1. Download URLs from your GitHub Release
 CLASSES_URL = "https://github.com/sundarrajandhamotharan7889-gif/crop-disease-api/releases/download/v1.0/classes.json"
-MODEL_URL = "https://github.com/sundarrajandhamotharan7889-gif/crop-disease-api/releases/download/v1.0/plant_hybrid_model.pth"
+MODEL_URL   = "https://github.com/sundarrajandhamotharan7889-gif/crop-disease-api/releases/download/v1.0/plant_hybrid_model.pth"
 
 CLASSES_FILE = "classes.json"
-MODEL_FILE = "plant_hybrid_model.pth"
+MODEL_FILE   = "plant_hybrid_model.pth"
 
 # Auto-download on startup if not present locally
 if not os.path.exists(CLASSES_FILE):
@@ -29,59 +27,58 @@ if not os.path.exists(MODEL_FILE):
     urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
     print("plant_hybrid_model.pth downloaded successfully!")
 
+# Load class labels
 with open(CLASSES_FILE, "r") as f:
-    CLASS_NAMES = json.load(f)
-print(f"Loaded {len(CLASS_NAMES)} disease classes.")
+    class_labels = json.load(f)
+if isinstance(class_labels, dict):
+    class_labels = [class_labels[k] for k in sorted(class_labels, key=lambda x: int(x))]
+print(f"Loaded {len(class_labels)} disease classes.")
 
-# ---------------------------------------------------------------------------
-# 2. Hybrid Model Architecture (EfficientNet-B0 + DenseNet-121)
-# ---------------------------------------------------------------------------
+# 2. Exact Hybrid Architecture matching your Colab training
 class HybridPlantClassifier(nn.Module):
     def __init__(self, num_classes):
-        super(HybridPlantClassifier, self).__init__()
-        self.effnet = models.efficientnet_b0(weights=None)
-        self.densenet = models.densenet121(weights=None)
+        super().__init__()
+        eff = models.efficientnet_b0(weights=None)
+        dense = models.densenet121(weights=None)
 
-        eff_in = self.effnet.classifier[1].in_features      # 1280
-        dense_in = self.densenet.classifier.in_features     # 1024
-
-        self.effnet.classifier = nn.Identity()
-        self.densenet.classifier = nn.Identity()
+        self.eff_feat = eff.features
+        self.eff_pool = nn.AdaptiveAvgPool2d(1)
+        self.dense_feat = dense.features
+        self.dense_pool = nn.AdaptiveAvgPool2d(1)
 
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(eff_in + dense_in, 256),
+            nn.Linear(2304, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
-        f1 = self.effnet(x)
-        f2 = self.densenet(x)
-        features = torch.cat((f1, f2), dim=1)
-        return self.classifier(features)
+        f1 = torch.flatten(self.eff_pool(self.eff_feat(x)), 1)
+        f2 = torch.flatten(self.dense_pool(self.dense_feat(x)), 1)
+        return self.classifier(torch.cat((f1, f2), dim=1))
 
-# Load model onto CPU (lightweight for Render Free Tier)
+# 3. Load model onto CPU
 device = torch.device("cpu")
-model = HybridPlantClassifier(num_classes=len(CLASS_NAMES))
-state_dict = torch.load(MODEL_FILE, map_location=device)
-model.load_state_dict(state_dict)
-model.eval()
-print("PyTorch Hybrid Model loaded and ready on CPU!")
+model = HybridPlantClassifier(num_classes=len(class_labels)).to(device)
 
-# Standard PlantVillage preprocessing transform
-transform = transforms.Compose([
+ckpt = torch.load(MODEL_FILE, map_location=device)
+state_dict = ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt
+model.load_state_dict(state_dict, strict=False)
+model.eval()
+print(f"Hybrid Model loaded successfully with {len(class_labels)} classes!")
+
+# 4. Standard Preprocessing
+predict_tf = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
 ])
 
-# ---------------------------------------------------------------------------
-# 3. FastAPI Application
-# ---------------------------------------------------------------------------
-app = FastAPI(title="Uzhavan 2.0 Deep Learning Inference Engine")
+# 5. FastAPI Application
+app = FastAPI(title="Uzhavan 2.0 Deep Learning API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,12 +89,11 @@ app.add_middleware(
 )
 
 @app.get("/")
-def root():
+def home():
     return {
         "status": "online",
-        "app": "Uzhavan 2.0 Inference Engine",
-        "architecture": "Hybrid EfficientNet-B0 + DenseNet-121",
-        "classes_count": len(CLASS_NAMES)
+        "service": "Uzhavan 2.0 Hybrid Inference API",
+        "classes_count": len(class_labels)
     }
 
 @app.post("/predict")
@@ -106,16 +102,18 @@ async def predict(
     crop: str = Form("tomato"),
     language: str = Form("en")
 ):
-    image = Image.open(file.file).convert("RGB")
-    tensor = transform(image).unsqueeze(0).to(device)
+    contents = await file.read()
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    tensor = predict_tf(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
         outputs = model(tensor)
-        probs = torch.softmax(outputs, dim=1)[0]
-        top_prob, top_idx = torch.max(probs, dim=0)
+        probs = torch.softmax(outputs, dim=1)
+        conf, idx = torch.max(probs, 1)
 
-    raw_label = CLASS_NAMES[top_idx.item()]
-    
+    raw_label = class_labels[idx.item()]
+    confidence = round(float(conf.item()), 4)
+
     # Format label cleanly (e.g., Tomato___Early_blight -> Early blight)
     clean_label = raw_label.replace("___", " ").replace("_", " ").strip()
     if clean_label.lower().startswith(crop.lower()):
@@ -124,10 +122,6 @@ async def predict(
     return {
         "disease": clean_label or raw_label,
         "crop": crop,
-        "confidence": round(float(top_prob.item()), 4),
+        "confidence": confidence,
         "raw_label": raw_label
     }
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
