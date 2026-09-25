@@ -1,13 +1,16 @@
 import io
-import numpy as np
+import json
+import os
 from PIL import Image
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-import tensorflow as tf
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
 
-app = FastAPI(title="Crop Disease Inference API")
+app = FastAPI(title="Leaf Doctor Hybrid Model API")
 
-# Enable CORS so your Lovable app can call this API
+# Enable CORS for Leaf Doctor
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,69 +19,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. Load model once during startup
-MODEL_PATH = "plant_model.h5"
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print("Model loaded successfully!")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    model = None
+device = torch.device("cpu")
 
-# 2. Put your exact training class labels in order
-CLASS_NAMES = [
-    "Tomato___Bacterial_spot",
-    "Tomato___Early_blight",
-    "Tomato___Late_blight",
-    "Tomato___Leaf_Mold",
-    "Tomato___Septoria_leaf_spot",
-    "Tomato___Spider_mites Two-spotted_spider_mite",
-    "Tomato___Target_Spot",
-    "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
-    "Tomato___Tomato_mosaic_virus",
-    "Tomato___healthy",
-    "Potato___Early_blight",
-    "Potato___Late_blight",
-    "Potato___healthy",
-    # Add the rest of your model's exact classes here
-]
+# 1. Load classes.json
+with open("classes.json", "r") as f:
+    class_labels = json.load(f)
+
+# 2. Define the exact Hybrid Model Architecture
+class HybridPlantClassifier(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        eff = models.efficientnet_b0(weights=None)
+        dense = models.densenet121(weights=None)
+
+        self.eff_feat = eff.features
+        self.eff_pool = nn.AdaptiveAvgPool2d(1)
+        self.dense_feat = dense.features
+        self.dense_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(2304, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        f1 = torch.flatten(self.eff_pool(self.eff_feat(x)), 1)
+        f2 = torch.flatten(self.dense_pool(self.dense_feat(x)), 1)
+        return self.classifier(torch.cat((f1, f2), dim=1))
+
+# 3. Load Model Weights
+model = HybridPlantClassifier(len(class_labels)).to(device)
+model.load_state_dict(torch.load("plant_hybrid_model.pth", map_location=device))
+model.eval()
+print(f"Loaded Hybrid Model with {len(class_labels)} disease classes!")
+
+# Image Transform
+predict_tf = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
 @app.get("/")
-def health_check():
+def home():
     return {
         "status": "online",
-        "service": "Leaf Doctor Inference API",
-        "model_loaded": model is not None
+        "service": "Leaf Doctor Hybrid Inference API",
+        "classes_count": len(class_labels)
     }
 
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    crop: str = Form("tomato")
+    crop: str = Form("tomato"),
+    language: str = Form("en")
 ):
-    # Read uploaded image bytes
     contents = await file.read()
-    image = Image.open(io.BytesIO(contents)).convert("RGB").resize((224, 224))
-    
-    # Preprocess image for the model
-    img_array = np.array(image, dtype=np.float32) / 255.0
-    img_batch = np.expand_dims(img_array, axis=0)
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    tensor = predict_tf(image).unsqueeze(0).to(device)
 
-    # Run inference
-    if model is not None:
-        predictions = model.predict(img_batch)[0]
-        predicted_idx = int(np.argmax(predictions))
-        confidence = float(predictions[predicted_idx])
-        predicted_label = CLASS_NAMES[predicted_idx]
-    else:
-        # Fallback if model failed to load
-        predicted_label = f"{crop.capitalize()} Early Blight"
-        confidence = 0.92
+    with torch.no_grad():
+        outputs = model(tensor)
+        probs = torch.softmax(outputs, dim=1)
+        conf, idx = torch.max(probs, 1)
 
-    # Clean label format (e.g., 'Tomato___Early_blight' -> 'Tomato Early Blight')
-    clean_label = predicted_label.replace("___", " ").replace("_", " ")
+    raw_label = class_labels[idx.item()]
+    confidence = round(conf.item(), 4)
+
+    # Format nicely (Tomato___Early_blight -> Tomato Early Blight)
+    clean_label = raw_label.replace("___", " ").replace("_", " ")
 
     return {
         "disease": clean_label,
-        "confidence": round(confidence, 4)
+        "crop": crop,
+        "confidence": confidence
     }
